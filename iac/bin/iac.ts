@@ -15,6 +15,8 @@ if (!postgresPassword) {
 
 new PostgresEc2Stack(app, "PostgresEc2Stack", {
   postgresPassword,
+  // todo replace with env
+  vpcId: "vpc-02eb6737e1516a04d",
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,

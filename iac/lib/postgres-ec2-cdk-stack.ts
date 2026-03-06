@@ -6,26 +6,21 @@ import { Construct } from "constructs";
 
 interface PostgresEc2StackProps extends cdk.StackProps {
   postgresPassword?: string;
+  vpcId: string;
 }
 
 export class PostgresEc2Stack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: PostgresEc2StackProps) {
+  public readonly instance: ec2.IInstance;
+  public readonly postgresSecurityGroup: ec2.ISecurityGroup;
+
+  constructor(scope: Construct, id: string, props: PostgresEc2StackProps) {
     super(scope, id, props);
 
-    // Use provided password or default
-    const dbPassword = props?.postgresPassword;
+    const dbPassword = props.postgresPassword;
 
-    // Create a simple VPC with public subnets only (cost-effective for MVP)
-    const vpc = new ec2.Vpc(this, "PostgresVPC", {
-      maxAzs: 2, // Use 2 availability zones
-      natGateways: 0, // No NAT gateway = save costs
-      subnetConfiguration: [
-        {
-          cidrMask: 24,
-          name: "Public",
-          subnetType: ec2.SubnetType.PUBLIC,
-        },
-      ],
+    // Import existing VPC instead of creating new one
+    const vpc = ec2.Vpc.fromLookup(this, "ImportedVPC", {
+      vpcId: props.vpcId,
     });
 
     // S3 bucket for backups
@@ -35,10 +30,10 @@ export class PostgresEc2Stack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       lifecycleRules: [
         {
-          expiration: cdk.Duration.days(30), // Keep backups for 30 days
+          expiration: cdk.Duration.days(30),
         },
       ],
-      removalPolicy: cdk.RemovalPolicy.RETAIN, // Don't delete backups on stack destroy
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     // Security group for PostgreSQL
@@ -48,21 +43,17 @@ export class PostgresEc2Stack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // No inbound rules needed - we'll use SSM for access
-    // SSM connects outbound only, no need to expose SSH or PostgreSQL ports
+    this.postgresSecurityGroup = postgresSecurityGroup;
 
     // IAM role for EC2 instance
     const role = new iam.Role(this, "PostgresEc2Role", {
       assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore"), // For Systems Manager
-      ],
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore")],
     });
 
-    // Grant S3 access for backups
     backupBucket.grantReadWrite(role);
 
-    // User data script to install and configure PostgreSQL
+    // Update user data to allow network connections
     const userData = ec2.UserData.forLinux();
     userData.addCommands(
       "#!/bin/bash",
@@ -78,12 +69,17 @@ export class PostgresEc2Stack extends cdk.Stack {
       "# Configure PostgreSQL password",
       `sudo -u postgres psql -c "ALTER USER postgres PASSWORD '${dbPassword}';"`,
       "",
-      "# PostgreSQL is configured to listen on localhost only (default)",
-      "# We will use SSM port forwarding to connect securely",
+      "# Configure PostgreSQL to listen on all interfaces (for VPC access)",
+      "echo \"listen_addresses = '*'\" >> /etc/postgresql/*/main/postgresql.conf",
+      "",
+      "# Allow connections from VPC CIDR",
+      'echo "host    all             all             10.0.0.0/16            md5" >> /etc/postgresql/*/main/pg_hba.conf',
+      "",
+      "# Restart PostgreSQL to apply changes",
+      "systemctl restart postgresql",
       "",
       "# Ensure PostgreSQL is enabled and started",
       "systemctl enable postgresql",
-      "systemctl start postgresql",
       "",
       "# Wait for PostgreSQL to be ready",
       "sleep 5",
@@ -95,28 +91,17 @@ export class PostgresEc2Stack extends cdk.Stack {
       'BACKUP_FILE="/tmp/postgres_backup_$TIMESTAMP.sql.gz"',
       `S3_BUCKET="${backupBucket.bucketName}"`,
       "",
-      "# Create backup",
       "sudo -u postgres pg_dumpall | gzip > $BACKUP_FILE",
-      "",
-      "# Upload to S3",
       "aws s3 cp $BACKUP_FILE s3://$S3_BUCKET/",
-      "",
-      "# Clean up local backup",
       "rm $BACKUP_FILE",
-      "",
       'echo "Backup completed: $TIMESTAMP"',
       "EOF",
       "",
       "chmod +x /usr/local/bin/backup-postgres.sh",
       "",
-      "# Set up daily backup cron job (runs at 2 AM)",
       'echo "0 2 * * * root /usr/local/bin/backup-postgres.sh >> /var/log/postgres-backup.log 2>&1" > /etc/cron.d/postgres-backup',
       "",
-      "# Run initial backup",
       "/usr/local/bin/backup-postgres.sh",
-      "",
-      "# Ensure PostgreSQL is still running after initial backup",
-      "systemctl start postgresql",
       "",
       'echo "PostgreSQL setup complete!"',
     );
@@ -124,6 +109,9 @@ export class PostgresEc2Stack extends cdk.Stack {
     // Create EC2 instance
     const instance = new ec2.Instance(this, "PostgresInstance", {
       vpc,
+      vpcSubnets: {
+        subnetType: ec2.SubnetType.PUBLIC, // Or PRIVATE if you have NAT
+      },
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
       machineImage: ec2.MachineImage.fromSsmParameter(
         "/aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id",
@@ -141,45 +129,35 @@ export class PostgresEc2Stack extends cdk.Stack {
           }),
         },
       ],
-      // No SSH key needed - using SSM for access
     });
 
-    // Outputs
+    this.instance = instance;
+
+    // Outputs (same as before)
     new cdk.CfnOutput(this, "InstanceId", {
       value: instance.instanceId,
       exportName: "PostgresDatabaseInstanceId",
       description: "EC2 Instance Id",
     });
 
-    new cdk.CfnOutput(this, "InstancePublicIp", {
-      value: instance.instancePublicIp,
-      description: "EC2 Instance Public IP",
+    new cdk.CfnOutput(this, "InstancePrivateIp", {
+      value: instance.instancePrivateIp,
+      exportName: "PostgresInstancePrivateIp",
+    });
+
+    new cdk.CfnOutput(this, "PostgresSecurityGroupId", {
+      value: postgresSecurityGroup.securityGroupId,
+      exportName: "PostgresInstanceSecurityGroupId",
+    });
+
+    new cdk.CfnOutput(this, "InstanceRoleArn", {
+      value: role.roleArn,
+      exportName: "PostgresDatabaseInstanceRoleArn",
     });
 
     new cdk.CfnOutput(this, "BackupBucket", {
       value: backupBucket.bucketName,
       description: "S3 Backup Bucket Name",
-    });
-
-    new cdk.CfnOutput(this, "SSMConnectCommand", {
-      value: `aws ssm start-session --target ${instance.instanceId}`,
-      description: "Command to connect via SSM Session Manager",
-    });
-
-    new cdk.CfnOutput(this, "SSMPortForwardCommand", {
-      value: `aws ssm start-session --target ${instance.instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=5432,localPortNumber=5432"`,
-      description: "Command to forward PostgreSQL port via SSM",
-    });
-
-    new cdk.CfnOutput(this, "PostgresConnectionString", {
-      value: `postgresql://postgres:<YOUR_PASSWORD>@localhost:5432/postgres`,
-      description: "PostgreSQL Connection String (use after SSM port forwarding)",
-    });
-
-    new cdk.CfnOutput(this, "InstanceRoleArn", {
-      value: role.roleArn,
-      description: "IAM Role ARN for the PostgreSQL EC2 instance",
-      exportName: "PostgresDatabaseInstanceRoleArn",
     });
   }
 }

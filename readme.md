@@ -50,7 +50,7 @@ import { PostgresEc2Stack } from '../lib/postgres-ec2-cdk-stack';
 
 const app = new cdk.App();
 new PostgresEc2Stack(app, 'PostgresEc2Stack', {
-  postgresPassword: process.env.POSTGRES_PASSWORD || 'changeme123', // Use env var or default
+  postgresPassword: process.env.POSTGRES_PASSWORD,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,
